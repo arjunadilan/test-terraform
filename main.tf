@@ -106,6 +106,26 @@ resource "aws_security_group" "temasys_rds_sg" {
   }
 }
 
+resource "aws_security_group" "temasys_elb_sg" {
+  name        = "temasys_elb_sg"
+  description = "RdS security group "
+  vpc_id      = "${aws_vpc.teamsys-vpc1.id}"
+
+  ingress {
+    to_port     = "80"
+    from_port   = "80"
+    protocol    = "tcp"
+    cidr_blocks = ["${var.cidrs["default_cidr"]}"]
+  }
+
+  egress {
+    to_port     = "0"
+    from_port   = "0"
+    protocol    = "-1"
+    cidr_blocks = ["${var.cidrs["default_cidr"]}"]
+  }
+}
+
 resource "aws_internet_gateway" "Temasys_IGW" {
   vpc_id = "${aws_vpc.teamsys-vpc1.id}"
 
@@ -249,20 +269,155 @@ resource "aws_instance" "temasys_public_ec2" {
   key_name               = "${aws_key_pair.keys.key_name}"
   vpc_security_group_ids = ["${aws_security_group.temasys_ec2_sg.id}"]
   subnet_id              = "${aws_subnet.temasys_pub_1.id}"
+}
 
-  provisionar "chef" {
-    attributes_json = <<-EOF
-      {
-        "key": "value",
-        "app": {
-          "cluster1": {
-            "nodes": [
-              "webserver1",
-              "webserver2"
-            ]
-          }
-        }
-      }
-    EOF
+resource "aws_elb" "temasys_elb" {
+  name = "${var.domain_name}-elb"
+
+  subnets = ["${aws_subnet.temasys_pub_1.id}",
+    "${aws_subnet.temasys_pub_2.id}",
+  ]
+
+  security_groups = ["${aws_security_group.temasys_rds_sg.id}"]
+
+  listener {
+    instance_port     = "80"
+    instance_protocol = "http"
+    lb_port           = "80"
+    lb_protocol       = "http"
   }
+
+  health_check {
+    healthy_threshold   = "${var.elb_healthy_threshold}"
+    unhealthy_threshold = "${var.elb_unhelthy_threshold}"
+    interval            = "5"
+    timeout             = "${var.elb_timeout}"
+    target              = "tcp:80"
+  }
+
+  cross_zone_load_balancing   = "true"
+  idle_timeout                = 400
+  connection_draining         = "true"
+  connection_draining_timeout = 400
+
+  tags {
+    Name = "temasys_${var.domain_name}-elb"
+  }
+}
+
+#--------------- Golden AMi ----------
+
+# RandomId
+
+resource "random_id" "golden_ami" {
+  byte_length = 3
+}
+
+# AMI
+
+resource "aws_ami_from_instance" "wp_golden" {
+  name               = "wp_golden-${random_id.golden_ami.b64}"
+  source_instance_id = "${aws_instance.temasys_public_ec2.id}"
+
+  provisioner "local-exec" {
+    command = <<EOT
+    cat <<EOF > userdata
+    #!/bin/bash
+    yum install httpd -y
+    chkconfig httpd on
+    service httpd restart
+    EOF
+    EOT
+  }
+}
+
+#---- lounch configuration 
+resource "aws_launch_configuration" "temasys_lc" {
+  name_prefix     = "temasys_lc"
+  image_id        = "${aws_ami_from_instance.wp_golden.id}"
+  instance_type   = "${var.ec2_type}"
+  security_groups = ["${aws_security_group.temasys_ec2_sg.id}"]
+  key_name        = "${aws_key_pair.keys.key_name}"
+
+  lifecycle {
+    create_before_destroy = "true"
+  }
+}
+
+#------------auto scailing group -
+
+resource "aws_autoscaling_group" "temasys_asg" {
+  name                      = "asg-${aws_launch_configuration.temasys_lc.id}"
+  max_size                  = "${var.as_max}"
+  min_size                  = "${var.as_min}"
+  health_check_grace_period = "${var.health_check }"
+  health_check_type         = "${var.asg_hct}"
+  desired_capacity          = "${var.asg_capt}"
+  force_delete              = "true"
+  load_balancers            = ["${aws_elb.temasys_elb.id}"]
+
+  vpc_zone_identifier = ["${aws_subnet.temasys_pri_1.id}",
+    "${aws_subnet.temasys_pri_2.id}",
+  ]
+
+  launch_configuration = "${aws_launch_configuration.temasys_lc.id}"
+
+  tag {
+    key                 = "Name"
+    value               = "temasys_asg_instances"
+    propagate_at_launch = "true"
+  }
+
+  lifecycle {
+    create_before_destroy = "True"
+  }
+}
+
+#------ route 53 -- 
+
+# primary zone
+resource "aws_route53_zone" "temasys_primary" {
+  name              = "${var.domain_name}.com"
+  delegation_set_id = "${var.delegation_set}"
+}
+
+# www recorde
+
+resource "aws_route53_record" "www" {
+  zone_id = "${aws_route53_zone.temasys_primary.zone_id}"
+  name    = "www.${var.domain_name}.com"
+  type    = "A"
+
+  alias {
+    name                   = "${aws_elb.temasys_elb.name}"
+    zone_id                = "${aws_elb.temasys_elb.zone_id}"
+    evaluate_target_health = "false"
+  }
+}
+
+# dev
+
+resource "aws_route53_record" "dev" {
+  zone_id = "${aws_route53_zone.temasys_primary.zone_id}"
+  name    = "dev.${var.domain_name}.com"
+  type    = "A"
+  ttl     = "300"
+  records = ["${aws_instance.temasys_public_ec2.public_ip}"]
+}
+
+# private zone
+
+resource "aws_route53_zone" "private_zone" {
+  name   = "${var.domain_name}.com"
+  vpc_id = "${aws_vpc.teamsys-vpc1.id}"
+}
+
+#db_recorde
+
+resource "aws_route53_record" "db_recorde" {
+  zone_id = "${aws_route53_zone.private_zone.zone_id}"
+  name    = "db.${var.domain_name}.com"
+  type    = "CNAME"
+  ttl     = "300"
+  records = ["${aws_db_instance.temasys_mysql.address }"]
 }

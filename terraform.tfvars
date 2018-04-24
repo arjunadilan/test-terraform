@@ -32,4 +32,30 @@ db_password = "123456"
 
 ec2_type = "t2.small"
 
-ec2_ami = "ami-e2adf99e"
+ec2_ami = "ami-467ca739"
+
+#--------------ELB 
+
+elb_healthy_threshold = "9"
+
+elb_unhelthy_threshold = "9"
+
+elb_timeout = "5"
+
+elb_interval = "6"
+
+domain_name = "sicario"
+
+#--------------- AutoScaling Group
+
+as_max = "2"
+
+as_min = "1"
+
+health_check = "300"
+
+asg_hct = "EC2"
+
+asg_capt = "2"
+
+delegation_set = "N3J6Q990AU6X3F"
